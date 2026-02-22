@@ -1,0 +1,70 @@
+spring:
+  application:
+    name: solchat
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/chat_db?serverTimezone=UTC&characterEncoding=UTF-8&rewriteBatchedStatements=true
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  jpa:
+    show-sql: false
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        format_sql: true
+        highlight_sql: true
+        generate_statistics: true
+        jdbc:
+          batch_size: 100
+          order_updates: true
+  jwt:
+    secret:
+      key: ${JWT_SECRET}
+  kafka:
+    # Producer 설정
+    producer:
+      # 카프카 브로커 목록
+      bootstrap-servers: localhost:9092, localhost:9093
+      # 키/값 직렬화 설정 (String 직렬화 사용)
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    # Consumer 설정
+    consumer:
+      bootstrap-servers: localhost:9092,localhost:9093
+      # 컨슈머 그룹
+      group-id: chat-message-group
+      # 키/값 역직렬화 설정
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      auto-offset-reset: earliest # 토픽 가장 처음부터 메시지 가져오기
+      properties:
+        spring.json.trusted.packages: com.sol.solchat.dto
+        spring.json.value.default.type: com.sol.solchat.dto.ChatMessage
+        spring.json.use.type.headers: false
+
+# 애플리케이션에서 사용할 카프카 토픽 정의
+chat:
+  kafka:
+    topic: chat-messages
+  server-id: "127.0.0.1:8080"
+  internal-secret: ${INTERNAL_SECRET}
+server:
+  port: 8080
+
+snowflake:
+  node-id: 1
+  custom-epoch: 1735689600000
+logging:
+  level:
+    root: INFO
+    com.sol.solchat: DEBUG
+    org.springframework.security: DEBUG
+    org.springframework.web.socket: DEBUG
+    org.hibernate.SQL: debug
+      # 파라미터 값(? 안에 들어가는 값)도 보고 싶은 경우
+    org.hibernate.orm.jdbc.bind: trace
