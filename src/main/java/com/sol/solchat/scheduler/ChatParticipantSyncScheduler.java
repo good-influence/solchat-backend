@@ -35,8 +35,8 @@ public class ChatParticipantSyncScheduler {
             try {
                 long roomId = Long.parseLong(roomIdStr);
                 // 트랜잭션 시작 -> 끝나고 커밋 -> 리턴됨
-                chatRoomService.syncReadStatusForRoom(roomId);  // 최적화 1단계
-//                chatRoomService.syncBulkReadStatusForRoom(roomId); // 최적화 2단계
+                //chatRoomService.syncReadStatusForRoom(roomId);  // 최적화 1단계
+                chatRoomService.syncBulkReadStatusForRoom(roomId); // 최적화 2단계
                 successCount ++;
             } catch (Exception e) {
                 log.error("읽음 상태 동기화 실패 (RoomId: {}): {}", roomIdStr, e.getMessage());
