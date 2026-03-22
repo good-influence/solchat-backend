@@ -28,8 +28,7 @@ public class JwtHandshakeInterceptor implements HandshakeInterceptor {
     public boolean beforeHandshake(ServerHttpRequest request, ServerHttpResponse response, WebSocketHandler wsHandler, Map<String, Object> attributes) throws Exception {
 
         // HTTP 요청인지 확인
-        if (request instanceof ServletServerHttpRequest) {
-            ServletServerHttpRequest servletRequest = (ServletServerHttpRequest) request;
+        if (request instanceof ServletServerHttpRequest servletRequest) {
             HttpServletRequest req = servletRequest.getServletRequest();
 
             // 쿼리 파라미터에서 token 추출

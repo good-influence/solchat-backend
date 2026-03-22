@@ -80,11 +80,11 @@ public class ChatMessageService {
 
         // DB 저장 (DB 저장 구간만 트랜잭션 적용), DB Transaction
         Message savedEntity = transactionTemplate.execute(status -> {
-            Message saved = messageRepository.save(messageEntity);
             // 방 존재 확인 (실패 시 롤백)
-            chatRoomRepository.findById(saved.getRoomId())
+            chatRoomRepository.findById(Long.parseLong(messageDTO.getRoomId()))
                     .orElseThrow(() -> new IllegalStateException("채팅방 찾을 수 없음"));
 
+            Message saved = messageRepository.save(messageEntity);
             log.info("메시지 RDB 저장 완료: Message ID {}", saved.getId());
             return saved;
         });
