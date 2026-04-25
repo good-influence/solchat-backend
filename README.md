@@ -313,23 +313,6 @@ k6 run --summary-export ws_summary_1on1.json \
 
 ---
 
-## 공개 저장소 정리 체크리스트 (중요)
-GitHub에 “포트폴리오”로 올릴 때 아래 파일/폴더는 제외를 권장합니다.
-- `.env` (시크릿 포함)
-- `solchat_perf_assets/ws/ws_pairs.json` (JWT 포함)
-- `target/`, `.idea/`, `.DS_Store` 등 빌드/IDE 산출물
-
-예시 `.gitignore`:
-```gitignore
-.env
-**/ws_pairs.json
-target/
-.idea/
-.DS_Store
-```
-
----
-
 ## 앞으로의 개선 아이디어
 - Kafka topic **partition 수 증가** + consumer concurrency 튜닝
 - 그룹 채팅의 participant 조회/전송 최적화(캐시/배치/streaming)
