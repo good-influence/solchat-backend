@@ -1,174 +1,186 @@
-# SolChat Backend
-**WebSocket + Kafka + Redis 기반 실시간 채팅 서버 (포트폴리오 프로젝트)**
+# SolChat
 
-> 목표: “실시간 채팅”을 구현하면서 **확장성/정합성/동시성/트래픽 제어/성능 검증**을 한 번에 경험할 수 있는 백엔드 시스템을 설계·구현했습니다.  
-> 단일 서버 WebSocket의 한계를 넘어 **Kafka 기반 메시지 파이프라인**, **Redis 세션/메타데이터**, **Lua Script 원자 업데이트**, **Write-behind 배치 동기화**, **Redis 기반 Token Bucket Rate Limit**까지 포함합니다.
+Spring Boot로 만든 실시간 채팅 백엔드 개인 프로젝트입니다.
 
----
+채팅 기능 자체보다 **메시지를 어디에 저장할지, 서버가 여러 대일 때 수신자를 어떻게 찾을지, 조회 성능과 데이터 정합성 사이에서 어떤 선택을 할지**를 직접 구현하면서 확인해 보고 싶었습니다.
 
-## 핵심 기능
-- **회원가입/로그인**
-  - 비밀번호 암호화 후 저장
-  - 로그인 시 JWT 발급
-- **채팅**
-  - WebSocket 실시간 메시지 송수신 (`/ws/chat?token=...`)
-  - **1:1 채팅방 생성**
-    - `chat_key` 정규화 + **UNIQUE 제약조건**으로 중복 생성 방지
-  - **그룹 채팅방 생성**
-    - 멤버 구성이 같은 기존 방 조회(옵션), 강제 생성 지원
-  - 채팅방 목록 조회
-    - 참여정보/미읽음 수/마지막 메시지(Write-behind 기반) 조합
-  - 채팅방 메시지 조회
-    - Paging(Slice), 최신순(내림차순)
-  - 메시지 읽음 처리 / 미읽음 개수 계산
-- **친구**
-  - 친구 목록 조회 / 단방향 친구 추가
-- **트래픽 제어**
-  - Redis 기반 Token Bucket Rate Limit (Bucket4j + Redis)
+현재 회원·친구·채팅방 관리 API와 WebSocket 메시지 전송, Kafka Consumer, Redis 상태 관리 등을 구현했습니다. 이 문서에는 구현한 내용과 설계 이유를 적고, 아직 검증하지 못했거나 개선이 필요한 부분도 구분했습니다.
 
----
+## 구현 범위
 
-## 기술 스택
-- **Java 17**, **Spring Boot 3.x**
-- Spring Web / Spring Security / Spring WebSocket
-- **MySQL 8** (JPA/Hibernate + JdbcTemplate Batch Update)
-- **Redis** (세션/메타데이터/읽음 위치/Rate Limit 저장소)
-- **Kafka** (메시지 브로커, Producer/Consumer)
-- **k6** (부하 테스트)
+- **인증·사용자:** 회원가입, 로그인, JWT 인증, 친구 추가 및 목록 조회
+- **채팅:** 1:1·그룹 채팅방 생성, WebSocket 메시지 송수신, 메시지·채팅방 목록 조회, 읽음 처리
+- **데이터 처리:** MySQL 메시지 저장, Redis 채팅방 메타데이터·읽음 위치 관리, 스케줄러 기반 Write-behind
+- **서버 간 전달:** Kafka 메시지 발행·소비, Redis 접속 위치 조회, Internal Relay API
+- **트래픽 제어:** Bucket4j + Redis를 이용한 요청별 Token Bucket Rate Limit
 
----
+기술 스택: Java 17, Spring Boot 3, Spring Data JPA, Spring Security, MySQL 8, Redis, Kafka, WebSocket, Docker Compose, k6
 
-## 아키텍처
+## 전체 구조
+
 ```mermaid
 flowchart LR
-  C[Client] -->|REST| APP[SolChat API Server]
-  C -->|WebSocket /ws/chat?token=JWT| APP
-
-  APP -->|write| DB[(MySQL)]
-  APP -->|Lua HSET/SADD, TTL| R[(Redis)]
-  APP -->|publish key=roomId| K[(Kafka topic: chat-messages)]
-
-  K -->|consume| CONS[Kafka Consumer]
-  CONS -->|deliver| APP
-
-  APP -->|online session? / user->server| R
-  APP -->|internal relay (X-Internal-Secret)| APP2[Other instance]
+    Client[Client] -->|REST / WebSocket| App[Spring Boot]
+    App -->|메시지·도메인 데이터 저장| DB[(MySQL)]
+    App -->|메타데이터·읽음 위치·접속 위치| Redis[(Redis)]
+    App -->|메시지 이벤트 발행| Kafka[(Kafka)]
+    Kafka --> Consumer[Kafka Consumer]
+    Consumer -->|로컬 WebSocket 전달| App
+    Consumer -->|수신자 위치 조회| Redis
+    App -->|다른 서버 접속자: Internal Relay| Other[Other instance]
+    Scheduler[Sync Scheduler] -->|dirty 대상 읽기| Redis
+    Scheduler -->|변경 데이터 반영| DB
 ```
 
----
+MySQL은 메시지 원본과 사용자·채팅방 등 도메인 데이터의 저장소로 사용했습니다. Redis에는 접속 위치와 채팅방 목록에 필요한 최신 상태를 두고, Kafka로 메시지 저장과 실시간 전달 처리를 분리했습니다.
 
-## 핵심 설계 포인트
+이 구성은 **여러 인스턴스를 고려한 구현**입니다. 실제 다중 인스턴스 장애·부하 환경에서 확장성을 검증했다는 의미는 아닙니다.
 
-### 1) 메시지 전송 파이프라인 (WS → DB → Redis → Kafka → Consumer → WS)
-1. **Handshake 단계**에서 JWT 검증 → `userId`를 WebSocket session attribute에 저장
-2. `handleTextMessage`에서
-   - **Rate Limit**(userId 기준) 적용
-   - **IDOR 방지**: 해당 room 참여자 여부 검증
-   - Snowflake 기반 메시지 ID 발급 → **MySQL 저장**
-   - **Redis Lua Script**로 chat_room 메타데이터 갱신(원자성 + 순서 보장)
-   - **Kafka publish**
-3. Kafka Consumer에서 참여자에게 메시지 배달
-   - 같은 인스턴스에 세션이 있으면 **바로 WS 전송**
-   - 없으면 Redis `userId → serverId` 매핑을 보고 **내부 relay API 호출**
+## 설계하면서 고민한 부분
 
-### 2) Redis Write-behind로 “목록 조회” 성능/DB 부하 제어
-- 마지막 메시지/정렬용 메타데이터를 Redis에 즉시 반영 (Lua Script + dirty set)
-- Scheduler가 dirty set을 일정 주기로 POP하여 **Batch Update**로 DB 반영  
-  → “목록 조회”는 Redis를 우선 조회하여 **실시간성을 유지**하면서, DB 업데이트는 **지연/배치**로 전환
+### 1. 메시지를 먼저 저장하는 이유
 
-### 3) 읽음 처리 (Read position) 설계
-- `/rooms/{roomId}/read` 호출 시
-  - Redis Hash(`room_read_pos:{roomId}`)에 유저별 last read position 저장
-  - dirty set에 roomId 추가
-- Scheduler가 dirty set을 처리하여 chat_participant 테이블에 batch 반영
+메시지를 WebSocket으로 먼저 전송하면, 이후 저장 과정에서 오류가 발생했을 때 화면에는 보였던 메시지가 DB에 남지 않을 수 있습니다. SolChat에서는 메시지 원본을 우선 보존하는 쪽을 선택했습니다.
 
-### 4) Rate Limit (Redis 기반 Token Bucket)
-- Bucket4j + Redis ProxyManager로 “토큰 소비” 방식 적용
-- 정책은 endpoint별로 key-prefix를 다르게 적용  
-  예) `auth:{ip}`, `join:{ip}`, `create_room:{userId}`, `msg:{userId}` 등
+현재 `ChatMessageService.processAndPublish()`의 순서는 다음과 같습니다.
 
----
+1. `TransactionTemplate` 안에서 MySQL에 메시지를 저장하고 **DB 트랜잭션을 커밋**합니다.
+2. Redis Lua 스크립트로 채팅방의 마지막 메시지 메타데이터를 갱신합니다.
+3. Kafka에 `roomId`를 key로 메시지 이벤트를 발행하도록 `send()`를 호출합니다.
+4. Consumer가 메시지를 받아 수신자의 WebSocket 세션 또는 Internal Relay로 전달합니다.
 
-## ERD (요약)
-```mermaid
-erDiagram
-  USER {
-    BIGINT id PK
-    VARCHAR username UK
-    VARCHAR password
-    VARCHAR nickname
-  }
+DB를 먼저 커밋하므로 이후 전달 단계가 실패하더라도 메시지 원본은 남습니다. 대신 **DB 커밋과 Redis 갱신, Kafka 발행은 하나의 원자적 작업이 아닙니다.** Redis에서 오류가 나면 Kafka 발행까지 진행하지 못할 수 있고, Kafka 비동기 발행이 실패해도 현재 애플리케이션에는 이를 복구하는 로직이 없습니다. (개선 예정)
 
-  FRIEND {
-    BIGINT id PK
-    BIGINT user_id FK
-    BIGINT friend_user_id FK
-    VARCHAR status
-    UNIQUE(user_id, friend_user_id)
-  }
+또한 `kafkaTemplate.send()` 직후 남기는 로그는 브로커의 수신 확인(ACK)이 아니라 **발행 호출 완료**를 의미합니다. 발행 성공·실패 처리, Transactional Outbox, Consumer의 중복 처리 방지는 개선 과제로 남겨두었습니다.
 
-  CHAT_ROOM {
-    BIGINT id PK
-    VARCHAR chat_key UK
-    VARCHAR name
-    VARCHAR type
-    BIGINT created_at
-    TEXT last_message
-    BIGINT last_sent_at
-    BIGINT last_message_id
-  }
+관련 코드: [`ChatMessageService`](src/main/java/com/sol/solchat/service/ChatMessageService.java)
 
-  CHAT_PARTICIPANT {
-    BIGINT id PK
-    BIGINT chat_room_id FK
-    BIGINT user_id FK
-    BIGINT last_read_message_id
-    UNIQUE(chat_room_id, user_id)
-  }
+### 2. 같은 두 사용자의 채팅방이 여러 개 만들어지지 않도록
 
-  CHAT_MESSAGE {
-    BIGINT id PK
-    BIGINT room_id FK
-    BIGINT sender_id FK
-    TEXT content
-    VARCHAR type
-    BIGINT sent_at
-  }
+1:1 채팅방은 누가 먼저 생성 요청을 보내든 같은 방을 찾아야 합니다. 그래서 사용자 ID 두 개를 작은 값부터 정렬해 `chat_key`를 만들고, DB에 `UNIQUE` 제약을 두었습니다.
 
-  USER ||--o{ FRIEND : "user_id"
-  USER ||--o{ FRIEND : "friend_user_id"
-  CHAT_ROOM ||--o{ CHAT_PARTICIPANT : has
-  USER ||--o{ CHAT_PARTICIPANT : joins
-  CHAT_ROOM ||--o{ CHAT_MESSAGE : has
-  USER ||--o{ CHAT_MESSAGE : sends"
+애플리케이션에서는 먼저 기존 방을 조회합니다. 동시에 생성 요청이 들어와 DB 제약 위반이 발생하면 기존 방을 다시 조회하도록 예외 처리 경로도 작성했습니다.
+
+다만 **동시에 두 요청이 충돌하는 상황에 대한 회귀 테스트는 아직 없습니다.** JPA의 INSERT가 트랜잭션 커밋 시점에 실행되면 현재 서비스 메서드 내부의 예외 처리 구문을 거치지 않을 수 있어, 실제 동시성 테스트와 예외 처리 보완이 필요합니다.
+
+관련 코드: [`ChatRoomService`](src/main/java/com/sol/solchat/service/ChatRoomService.java), [`ChatController`](src/main/java/com/sol/solchat/controller/ChatController.java)
+
+### 3. 마지막 메시지와 읽음 상태를 매번 DB에 기록하지 않도록
+
+메시지 하나를 보낼 때마다 `chat_room`의 마지막 메시지를 갱신하고, 읽음 요청마다 `chat_participant`를 즉시 갱신하면 실시간 요청 경로에 DB 쓰기가 계속 추가됩니다.
+
+이를 줄이기 위해 채팅방의 `lastMessage`, `lastSentAt`, `lastMessageId`와 사용자별 읽음 위치를 우선 Redis에 반영합니다. 변경된 방 ID는 dirty set에 기록하고, 스케줄러가 대상 방을 모아 DB에 반영합니다. 채팅방 목록에서는 Redis의 최신 메타데이터를 우선 사용합니다.
+
+메타데이터 갱신에는 Lua 스크립트를 사용했습니다. 마지막 메시지 ID를 비교한 뒤 Hash 갱신과 dirty set 추가를 한 번에 실행해, 이전 메시지가 나중에 도착해 최신 메타데이터를 덮어쓰는 일을 줄이려는 목적입니다.
+
+- 채팅방 메타데이터: `chatroom:metadata:{roomId}`
+- 읽음 위치: `room:read_pos:{roomId}` (Hash field: `userId`)
+- 읽음 위치 변경 대상: `room:read_pos:dirty`
+
+이 방식의 대가는 **Redis와 DB 사이의 일시적 불일치**입니다. 일부 DB 동기화 실패 시 dirty 대상을 재등록하는 처리는 있지만, 스케줄러 중단이나 처리 중 장애에 대한 완전한 복구 보장은 아직 없습니다. Redis Streams 또는 ACK 가능한 큐 기반 동기화는 후속 개선 후보입니다.
+
+### 4. 채팅방 목록에서 반복 조회 줄이기
+
+채팅방 목록을 조회할 때 방마다 참여자와 상대 사용자 정보를 개별 조회하면 N+1 쿼리가 발생할 수 있습니다.
+
+이를 줄이기 위해 채팅방 ID를 먼저 모아 참여자를 `IN` 조회하고, 1:1 채팅 상대의 사용자 정보도 일괄 조회한 뒤 `Map`으로 응답을 조립했습니다.
+
+다만 **미읽음 개수는 현재 방마다 COUNT 쿼리를 실행합니다.** 참여자·상대 사용자 조회는 묶었지만 모든 조회 병목을 제거한 것은 아닙니다. 방별 COUNT는 다음 최적화 대상입니다.
+
+### 5. 다른 서버에 접속한 사용자에게 메시지 전달하기
+
+WebSocket 세션은 연결을 받은 서버의 메모리에 있습니다. 수신자의 세션이 현재 서버에 없다면 Redis에서 `userId → serverId` 매핑을 조회하고, 대상 서버의 Internal Relay API로 전달하도록 구성했습니다.
+
+이 경로는 코드로 구현했지만 실제 다중 인스턴스 E2E 테스트는 별도로 수행하지 않았습니다. 현재 Relay 실패 시 로그만 남기며 재시도·서킷브레이커는 구현하지 않았습니다. 사용자당 단일 서버 매핑 방식은 멀티 디바이스 접속에도 한계가 있습니다.
+
+### 6. 인증과 요청 제한
+
+WebSocket 연결 시 JWT를 검증해 서버 세션에 `userId`를 저장하고, 메시지 처리 시 클라이언트가 보낸 `sender` 대신 검증된 사용자 ID를 사용합니다. 메시지 전송 전 채팅방 참여 여부도 확인합니다.
+
+또한 Bucket4j와 Redis를 이용해 요청별 Token Bucket을 적용했습니다. 회원가입·로그인 등 인증 전 요청은 IP 기준, 인증 후 채팅방 생성·메시지 전송 등은 사용자 ID 기준으로 제한합니다.
+
+## 테스트 및 측정
+
+### 작성된 테스트와 아직 부족한 검증
+
+프로젝트에 회원가입·로그인, 친구 추가, Rate Limit, Redis Lua 메타데이터 갱신, 스케줄러 동기화 등 일부 테스트 코드가 있습니다. 테스트 **코드가 존재하는 것**과 모든 통합 시나리오가 **검증을 통과한 것**은 구분하고 있습니다.
+
+추가로 필요한 테스트는 다음과 같습니다.
+
+- 동일한 사용자 조합의 1:1 채팅방 동시 생성과 UNIQUE 충돌 처리
+- MySQL 저장 성공 후 Redis·Kafka 실패 주입
+- WebSocket → Kafka → Consumer → WebSocket 통합 흐름
+- Internal Relay 및 장애 상황에서의 전달 결과
+
+### k6 측정 결과
+
+로컬 Docker 환경에서 측정한 결과입니다. 운영 환경의 처리량이나 지연 시간을 보장하는 수치는 아닙니다.
+
+| 시나리오 | 조건 | 결과 |
+| --- | --- | --- |
+| 채팅방 목록 API | Read API 혼합 부하 약 100 RPS, 3분 | p95 약 **67ms** |
+| 메시지 목록 API | 동일 테스트 | p95 약 **10ms** |
+| WebSocket 1:1 메시지 전달 | sender 50 + receiver 50 세션, 1분 전송 | 송신자 timestamp 기준 E2E p95 약 **243ms** |
+
+REST Read API 측정에서는 HTTP error 0%를 기록했습니다. 이 결과는 정상 흐름의 응답 지연 측정이며, Kafka 장애 복구나 다중 서버 Relay의 정상 동작을 증명하지는 않습니다.
+
+테스트 스크립트와 결과 파일은 [`solchat_perf_assets/`](solchat_perf_assets/)에서 확인할 수 있습니다.
+
+## 남아 있는 문제
+
+| 영역 | 현재 한계 | 다음에 확인하거나 개선할 내용 |
+| --- | --- | --- |
+| 메시지 정합성 | DB 커밋 후 Redis·Kafka에서 실패하면 실시간 전달 누락 가능 | 장애 주입 테스트, 발행 결과 처리, Outbox 검토 |
+| Kafka 재처리 | Consumer 중복 전달 방지 미구현 | `messageId` 기반 멱등 처리 |
+| 1:1 방 동시 생성 | 커밋 시점 UNIQUE 충돌 응답 미검증 | 동시성 통합 테스트 및 예외 처리 보완 |
+| Write-behind | 일부 실패 경로에서 dirty 대상 유실 가능 | ACK 기반 동기화·복구 전략 검토 |
+| Internal Relay | 서버 간 전달 E2E·실패 재시도 미검증 | 다중 서버 테스트, 재시도 정책 |
+| 채팅방 조회 | 방별 unread COUNT 쿼리 | 집계 테이블 또는 카운터 방식 비교 |
+| 멀티 디바이스 | `userId → serverId` 단일 위치 매핑 | 세션 단위 매핑 설계 |
+
+## 실행 방법
+
+### 준비
+
+- Java 17
+- Docker / Docker Compose
+
+저장소의 `.env.example`을 복사하고 로컬 설정을 입력합니다.
+
+```bash
+cp .env.example .env
 ```
 
-> 1:1 중복 방 생성 방지: `chat_room.chat_key UNIQUE`  
-> 중복 참여 방지: `chat_participant(chat_room_id, user_id) UNIQUE`  
-> 중복 친구 추가 방지: `friend(user_id, friend_user_id) UNIQUE`
+`.env`에 `DB_USERNAME`, `DB_PASSWORD`, `DB_ROOT_PASSWORD`, `JWT_SECRET`, `INTERNAL_SECRET` 등을 설정합니다. **`.env`나 테스트용 JWT 파일은 저장소에 커밋하지 않습니다.**
 
----
+### 로컬 실행
 
-## API
+```bash
+# MySQL / Redis / Kafka / Kafka UI
+docker compose up -d
 
-### REST
-- Auth
-  - `POST /api/auth/join`
-  - `POST /api/auth/login`
-- Chat
-  - `POST /api/chat/room` (1:1 채팅방 생성)
-  - `POST /api/chat/group` (그룹 채팅방 생성)
-  - `GET  /api/chat/rooms` (내 채팅방 목록)
-  - `GET  /api/chat/rooms/{roomId}/messages` (특정 방 메시지 조회)
-  - `POST /api/chat/rooms/{roomId}/read` (읽음 처리)
-  - `POST /api/chat/heartbeat` (세션 TTL 연장)
-- Friends
-  - `GET  /api/friends`
-  - `POST /api/friends`
+# Spring Boot 애플리케이션
+./mvnw spring-boot:run
+```
 
-### WebSocket
-- Connect: `ws://localhost:8080/ws/chat?token=<JWT>`
-- Send JSON example:
+Kafka UI: <http://localhost:8090>
+
+### 주요 API
+
+| 기능 | 메서드 | 경로 |
+| --- | --- | --- |
+| 회원가입 | POST | `/api/auth/join` |
+| 로그인 | POST | `/api/auth/login` |
+| 1:1 채팅방 생성 | POST | `/api/chat/room` |
+| 그룹 채팅방 생성 | POST | `/api/chat/group` |
+| 채팅방 목록 | GET | `/api/chat/rooms` |
+| 메시지 목록 | GET | `/api/chat/rooms/{roomId}/messages` |
+| 읽음 처리 | POST | `/api/chat/rooms/{roomId}/read` |
+| 세션 Heartbeat | POST | `/api/chat/heartbeat` |
+| 친구 목록 / 추가 | GET / POST | `/api/friends` |
+
+WebSocket 연결: `ws://localhost:8080/ws/chat?token=<JWT>`
+
 ```json
 {
   "type": "CHAT",
@@ -177,96 +189,15 @@ erDiagram
   "content": "hello"
 }
 ```
-> `sender`는 서버가 **세션의 userId로 overwrite**합니다.
 
-### Internal (멀티 인스턴스 relay)
-- `POST /internal/chat/relay`
-  - Header: `X-Internal-Secret: <INTERNAL_SECRET>`
-  - Body: `{ targetUserId, message }`
+`sender` 값은 서버에서 WebSocket 세션의 인증된 사용자 ID로 대체합니다.
 
----
+### k6 테스트 실행
 
-## 로컬 실행 방법
-
-### 0) 준비물
-- Java 17
-- Docker / Docker Compose
-
-### 1) 환경변수 설정
-```bash
-cp .env.example .env
-```
-
-`.env`에 아래 값을 채웁니다.
-- `DB_USERNAME`
-- `DB_PASSWORD`
-- `DB_ROOT_PASSWORD`
-- `JWT_SECRET`
-- `INTERNAL_SECRET`
-
-> ✅ **공개 저장소에는 `.env`를 커밋하지 마세요.**
-
-### 2) 인프라 실행 (Redis / MySQL / Kafka / Kafka UI)
-```bash
-docker compose up -d
-```
-
-Kafka UI: `http://localhost:8090`
-
-### 3) 애플리케이션 실행
-```bash
-./mvnw spring-boot:run
-```
-
----
-
-## 테스트 방법
-
-### A) REST 기능 테스트 (예: curl)
-1) 회원가입
-```bash
-curl -X POST http://localhost:8080/api/auth/join \
-  -H "Content-Type: application/json" \
-  -d '{"username":"user01","password":"Pass1234!","nickname":"User01"}'
-```
-
-2) 로그인(JWT 받기)
-```bash
-TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"user01","password":"Pass1234!"}' | jq -r .token)
-echo $TOKEN
-```
-
-3) 1:1 채팅방 생성
-```bash
-curl -X POST http://localhost:8080/api/chat/room \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"targetUserId": 1000000001001}'
-```
-
-### B) WebSocket 수동 테스트
-브라우저 기본 WebSocket API는 헤더를 넣기 어렵기 때문에 **쿼리 파라미터로 토큰을 전달**합니다.
-
-- 연결: `ws://localhost:8080/ws/chat?token=<JWT>`
-- 보내는 데이터: 위 JSON 예시
-
----
-
-## 부하 테스트 (k6)
-
-> 부하 테스트 스크립트/시드 데이터는 `solchat_perf_assets/`에 있습니다.
-
-### 1) (권장) 테스트용 데이터 시딩
-MySQL 컨테이너에 seed SQL을 주입합니다.
+테스트 데이터와 토큰을 준비한 뒤 아래 스크립트를 실행할 수 있습니다. 자세한 시드 파일과 실행 조건은 `solchat_perf_assets/`를 참고합니다.
 
 ```bash
-docker exec -i mysql mysql -uroot -p${DB_ROOT_PASSWORD} chat_db < solchat_perf_assets/rooms/seed_loadtest.sql
-```
-
-### 2) REST Read Path (rooms + messages)
-```bash
+# 채팅방·메시지 목록 Read API
 k6 run --summary-export summary_50.json \
   -e BASE_URL=http://localhost:8080 \
   -e TOKEN="$TOKEN" \
@@ -275,15 +206,12 @@ k6 run --summary-export summary_50.json \
   solchat_perf_assets/rooms/k6_rooms_messages.js
 ```
 
-### 3) WS + Kafka E2E Latency
-1) `ws_pairs.json` 생성(토큰 포함 파일이므로 **커밋 금지**)
+WebSocket E2E 테스트는 `solchat_perf_assets/ws/`의 사용자 쌍 생성 스크립트와 k6 스크립트를 사용합니다. 테스트용 계정과 토큰 정보를 준비한 뒤 실행합니다.
+
 ```bash
 cd solchat_perf_assets/ws
 python3 generate_1on1_pairs.py
-```
 
-2) 실행
-```bash
 k6 run --summary-export ws_summary_1on1.json \
   -e WS_BASE_URL=ws://localhost:8080 \
   -e RECEIVER_VUS=50 \
@@ -295,26 +223,4 @@ k6 run --summary-export ws_summary_1on1.json \
   k6_ws_chat_e2e_aligned.js
 ```
 
----
-
-## 성능 결과 (로컬 Docker 환경 측정 예시)
-### REST: 채팅방 목록/메시지 조회 (Read API)
-- 100 RPS (constant-arrival-rate), 3분
-- `rooms` p95 ≈ **67ms**
-- `messages` p95 ≈ **10ms**
-- HTTP error 0% (check 기준)
-
-### WS: 1:1 일반 채팅 (WS → Kafka → Consumer → WS)
-- 50 sender + 50 receiver (총 100 sessions), 1분 전송
-- E2E latency p95 ≈ **243ms** (k6 timestamp 기반)
-
-> 📌 “정확한 수치/재현 방법”을 README에 함께 남겨두는 것을 목표로 했습니다.  
-> 운영 환경(네트워크/서버 스펙/파티션 수/DB 튜닝)에 따라 결과는 달라질 수 있습니다.
-
----
-
-## 앞으로의 개선 아이디어
-- Kafka topic **partition 수 증가** + consumer concurrency 튜닝
-- 그룹 채팅의 participant 조회/전송 최적화(캐시/배치/streaming)
-- 관측성(메트릭/트레이싱) 추가: WS E2E, Kafka lag, DB slow query
-- 장애 대응: relay 실패 시 재시도/서킷브레이커/푸시 알림 연계
+⚠️ ws_pairs.json에는 테스트 계정의 JWT 토큰이 포함되므로 Git에 커밋하지 않습니다.
